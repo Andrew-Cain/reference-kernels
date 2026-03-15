@@ -1,3 +1,5 @@
+#!POPCORN leaderboard amd-mixed-mla
+#!POPCORN gpu MI355X
 """
 MLA (Multi-head Latent Attention) decode kernel — submission template.
 

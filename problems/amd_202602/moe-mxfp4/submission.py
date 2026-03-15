@@ -1,3 +1,5 @@
+#!POPCORN leaderboard amd-moe-mxfp4
+#!POPCORN gpu MI355X
 import torch
 from typing import Dict
 from task import input_t, output_t

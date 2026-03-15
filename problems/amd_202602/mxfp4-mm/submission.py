@@ -1,3 +1,5 @@
+#!POPCORN leaderboard amd-mxfp4-mm
+#!POPCORN gpu MI355X
 """
 FP4 quant + FP4 GEMM reference: bf16 A, MXFP4 B -> MXFP4 per-1x32 quant A -> gemm_a4w4 -> bf16 C.
 Quant logic follows aiter op_tests/test_gemm_a4w4.py (get_triton_quant(QuantType.per_1x32)).
