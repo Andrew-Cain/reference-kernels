@@ -48,3 +48,26 @@ This is why:
 
 Split-K config: num_ksplit = min(16, max(1, 1024 // output_tiles)).
 Small-M shapes (M=4, 32) are near reference. Large-K shapes (K=7168, 2048) are 1.7-2.3x slower.
+
+# Fused Atomic Reduce (tl.atomic_add, sem="relaxed") — REJECTED
+
+Replaced separate `_reduce_kernel` with `tl.atomic_add` in the GEMM kernel.
+All K-splits atomically accumulate float32 into a single [M,N] buffer, then
+convert to bf16 via `c_out.to(torch.bfloat16)` in Python.
+
+| M | N | K | Mean | Best | Worst | vs 2-kernel | vs Reference |
+|---|------|------|------|------|-------|-------------|--------------|
+| 4 | 2880 | 512 | 20.3 µs | 19.7 µs | 25.3 µs | +2.5% | 1.05x |
+| 16 | 2112 | 7168 | 57.2 µs | 55.8 µs | 61.7 µs | +2.9% | 1.71x |
+| 32 | 4096 | 512 | 25.1 µs | 24.4 µs | 29.4 µs | +12.6% | 1.27x |
+| 32 | 2880 | 512 | 22.3 µs | 21.6 µs | 27.0 µs | +10.4% | 1.12x |
+| 64 | 7168 | 2048 | 62.6 µs | 61.1 µs | 67.9 µs | +12.6% | 2.59x |
+| 256 | 3072 | 1536 | 32.0 µs | 31.0 µs | 35.2 µs | +0.3% | 1.38x |
+
+**Result: slower across all split-K shapes (2.5–12.6%).** M=256 unchanged (no split-K).
+
+**Why it's slower:**
+1. Atomic contention — even 2 K-splits serialize L2 atomic adds per output element
+2. `c_out.to(torch.bfloat16)` is itself a kernel launch, replacing the reduce kernel
+   with an equally expensive dtype conversion kernel
+3. Net effect: traded reduce kernel overhead for atomic overhead + conversion overhead

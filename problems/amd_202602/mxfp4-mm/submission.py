@@ -30,8 +30,8 @@ _b_scale_cache: dict = {}
 #  HARDWARE (not a loop — single MFMA instruction per iteration):
 #    [H]  tl.dot_scaled — computes BLOCK_M x BLOCK_N x BLOCK_K fp4 matmul tile
 #
-#  REDUCTION (separate kernel, parallel over M and N tiles):
-#    [R]  _reduce_kernel — sums NUM_KSPLIT partial [M,N] results → final [M,N]
+#  REDUCTION (fused into GEMM kernel via tl.atomic_add when NUM_KSPLIT > 1):
+#    [R]  L2 atomic add — each CU atomically accumulates its partial into output
 # =============================================================================
 
 
@@ -42,7 +42,7 @@ def _mxfp4_gemm_kernel(
     M, N, K,
     stride_am, stride_ak,
     stride_bk, stride_bn,
-    stride_ck, stride_cm, stride_cn,
+    stride_cm, stride_cn,
     stride_asm, stride_ask,
     stride_bsn, stride_bsk,
     BLOCK_M: tl.constexpr,
@@ -113,56 +113,17 @@ def _mxfp4_gemm_kernel(
         b_sc_ptrs += (BLOCK_K // SCALE_GROUP) * stride_bsk
 
     # -------------------------------------------------------------------------
-    # Write this CU's partial result into c_partial[pid_k, :, :]
-    # (when NUM_KSPLIT == 1 this is the final output)
+    # [R] Write output: atomic_add for fused split-K reduction, store for direct
     # -------------------------------------------------------------------------
-    # Compile-time branch: keep float32 for split-K partials, convert to bf16 for direct output
-    if NUM_KSPLIT > 1:
-        c = acc          # float32 → float32 partial buffer
-    else:
-        c = acc.to(tl.bfloat16)  # float32 → bf16 final output
-    offs_cm = offs_m.to(tl.int64)
-    offs_cn = offs_n.to(tl.int64)
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     c_ptrs = (c_ptr
-              + pid_k * stride_ck
-              + offs_cm[:, None] * stride_cm
-              + offs_cn[None, :] * stride_cn)
-    tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
-
-
-@triton.jit
-def _reduce_kernel(
-    c_in_ptr, c_out_ptr,
-    M, N,
-    stride_k, stride_in_m, stride_in_n,
-    stride_out_m, stride_out_n,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    NUM_KSPLIT: tl.constexpr,  # must be next_power_of_2 for tl.sum
-):
-    """
-    [R] REDUCTION (parallel over output tiles, sequential sum over NUM_KSPLIT):
-    Sum c_partial[NUM_KSPLIT, M, N] → c_out[M, N].
-    Each CU owns one (M-tile, N-tile) and sums all K-split partial results.
-    """
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, NUM_KSPLIT)
-
-    # Load all K-split partials for this (M-tile, N-tile)
-    ptrs = (c_in_ptr
-            + offs_k[:, None, None] * stride_k
-            + offs_m[None, :, None] * stride_in_m
-            + offs_n[None, None, :] * stride_in_n)
-    partials = tl.load(ptrs, mask=((offs_m[None, :, None] < M) & (offs_n[None, None, :] < N)), other=0.0)
-    out = tl.sum(partials, axis=0).to(tl.bfloat16)
-
-    out_ptrs = (c_out_ptr
-                + offs_m[:, None] * stride_out_m
-                + offs_n[None, :] * stride_out_n)
-    tl.store(out_ptrs, out, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+              + offs_m[:, None].to(tl.int64) * stride_cm
+              + offs_n[None, :].to(tl.int64) * stride_cn)
+    if NUM_KSPLIT > 1:
+        # Fused reduction: atomically accumulate float32 partials in-place
+        tl.atomic_add(c_ptrs, acc, mask=c_mask, sem="relaxed")
+    else:
+        tl.store(c_ptrs, acc.to(tl.bfloat16), mask=c_mask)
 
 
 def mxfp4_gemm(A_q, B_q, A_scale, B_scale, M, N, K, num_ksplit=1,
@@ -172,7 +133,7 @@ def mxfp4_gemm(A_q, B_q, A_scale, B_scale, M, N, K, num_ksplit=1,
 
     Grid = [P1] × [P2] × [P3] = NUM_KSPLIT × ceil(M/BLOCK_M) × ceil(N/BLOCK_N) CUs in parallel.
     Each CU runs [S1] = SPLITK_BLOCK // BLOCK_K sequential K-tile iterations.
-    If NUM_KSPLIT > 1, a separate reduction kernel sums the partial results.
+    If NUM_KSPLIT > 1, reduction is fused via tl.atomic_add (no separate reduce kernel).
 
     Args:
         A_q:     [M, K//2]  fp4x2 (2 fp4 values packed per byte)
@@ -192,15 +153,13 @@ def mxfp4_gemm(A_q, B_q, A_scale, B_scale, M, N, K, num_ksplit=1,
 
     use_splitk = actual_ksplit > 1
 
-    # Allocate output: partial buffer for split-K, or final buffer directly
-    # Pad to next_power_of_2 so reduce kernel's tl.arange(0, NUM_KSPLIT) stays in bounds
+    # Allocate output:
+    # - split-K: float32 zeroed buffer for atomic_add accumulation
+    # - no split: bf16 buffer for direct store
     if use_splitk:
-        padded_ksplit = triton.next_power_of_2(actual_ksplit)
-        c_partial = torch.zeros((padded_ksplit, M, N), dtype=torch.float32, device=A_q.device)
-        c_buf = c_partial
+        c_out = torch.zeros((M, N), dtype=torch.float32, device=A_q.device)
     else:
         c_out = torch.empty((M, N), dtype=torch.bfloat16, device=A_q.device)
-        c_buf = c_out
 
     # B is stored [N, K//2]; we pass it transposed so kernel sees [K//2, N]
     B_t = B_q.T.contiguous()
@@ -214,13 +173,12 @@ def mxfp4_gemm(A_q, B_q, A_scale, B_scale, M, N, K, num_ksplit=1,
     grid = (actual_ksplit * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
 
     _mxfp4_gemm_kernel[grid](
-        A_u8, B_u8, c_buf,
+        A_u8, B_u8, c_out,
         A_scale, B_scale,
         M, N, K_packed,
         A_u8.stride(0),  A_u8.stride(1),
         B_u8.stride(0),  B_u8.stride(1),
-        c_buf.stride(0) if use_splitk else 0,  # stride_ck: stride between K-split slices
-        c_buf.stride(-2), c_buf.stride(-1),    # stride_cm, stride_cn
+        c_out.stride(0), c_out.stride(1),
         A_scale.stride(0), A_scale.stride(1),
         B_scale.stride(0), B_scale.stride(1),
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
@@ -231,17 +189,9 @@ def mxfp4_gemm(A_q, B_q, A_scale, B_scale, M, N, K, num_ksplit=1,
         num_warps=4, num_stages=2,
     )
 
+    # Convert float32 atomic accumulation to bf16
     if use_splitk:
-        # [R] reduction kernel: parallel over (M-tile, N-tile), sequential sum over K-splits
-        c_out = torch.empty((M, N), dtype=torch.bfloat16, device=A_q.device)
-        grid_reduce = (triton.cdiv(M, 16), triton.cdiv(N, 64))
-        _reduce_kernel[grid_reduce](
-            c_partial, c_out, M, N,
-            c_partial.stride(0), c_partial.stride(1), c_partial.stride(2),
-            c_out.stride(0), c_out.stride(1),
-            BLOCK_M=16, BLOCK_N=64,
-            NUM_KSPLIT=padded_ksplit,  # must equal c_partial.shape[0] (power-of-2)
-        )
+        c_out = c_out.to(torch.bfloat16)
 
     return c_out
 
