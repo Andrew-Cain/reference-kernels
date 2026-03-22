@@ -71,3 +71,23 @@ convert to bf16 via `c_out.to(torch.bfloat16)` in Python.
 2. `c_out.to(torch.bfloat16)` is itself a kernel launch, replacing the reduce kernel
    with an equally expensive dtype conversion kernel
 3. Net effect: traded reduce kernel overhead for atomic overhead + conversion overhead
+
+# HIP C++ MFMA Kernel (submission_hip.py, HIPRTC + atomic split-K)
+
+Uses `__builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4` directly via HIPRTC.
+BLOCK_M=16, BLOCK_N=64, 4 wavefronts per workgroup, atomic float32 split-K.
+
+| M | N | K | Mean | Best | Worst | vs Reference | vs Triton |
+|---|------|------|------|------|-------|-------------|-----------|
+| 4 | 2880 | 512 | 20.4 µs | 19.8 µs | 25.2 µs | 1.05x | 1.03x |
+| 16 | 2112 | 7168 | 27.5 µs | 26.5 µs | 32.3 µs | 0.82x | 0.49x |
+| 32 | 4096 | 512 | 21.3 µs | 20.4 µs | 30.0 µs | 1.08x | 0.96x |
+| 32 | 2880 | 512 | 20.8 µs | 19.9 µs | 29.1 µs | 1.05x | 1.03x |
+| 64 | 7168 | 2048 | 39.5 µs | 38.2 µs | 44.2 µs | 1.63x | 0.71x |
+| 256 | 3072 | 1536 | 36.4 µs | 35.2 µs | 43.4 µs | 1.58x | 1.14x |
+
+**Key observations:**
+- Beats Triton significantly on high-K shapes (16×2112×7168: 2x faster, 64×7168×2048: 1.4x faster)
+- 16×2112×7168 actually beats the aiter reference (0.82x)
+- Slower on large-tile shapes (M=256) — likely due to naive global memory access pattern
+- Next step: LDS-based intra-workgroup K reduction to eliminate atomics
