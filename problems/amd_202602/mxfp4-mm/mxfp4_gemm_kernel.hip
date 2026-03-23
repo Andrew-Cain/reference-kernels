@@ -1,13 +1,21 @@
 // ============================================================================
-// MXFP4 GEMM kernel for MI355X (gfx950)
+// MXFP4 GEMM kernel for MI355X (gfx950) — dual MFMA variant
 //
-// Computes C[M,N] = A[M,K] @ B[N,K]^T using the MFMA 16x16x128 FP4 intrinsic.
+// Computes C[M,N] = A[M,K] @ B[N,K]^T using MFMA FP4 intrinsics.
 // A and B are MXFP4-quantized: E2M1 data packed 2 values per byte, with
 // E8M0 per-block scales (one scale per 32 elements along K).
 //
-// Workgroup layout: 256 threads = 4 wavefronts of 64 threads each.
-// Each wavefront computes one 16x16 output sub-tile via a single MFMA.
-// The 4 wavefronts tile across the N dimension: BLOCK_N = 4 * 16 = 64.
+// Compile-time MFMA_MODE selects the instruction variant:
+//
+//   MFMA_MODE 0 — mfma_scale_f32_16x16x128_f8f6f4
+//     4 wavefronts (256 threads), BLOCK_M=16, BLOCK_N=64
+//     128 FP4 per MFMA = 64 packed bytes, 4 float accumulator per thread
+//     Best for: high-K shapes where CUs are already well saturated
+//
+//   MFMA_MODE 1 — mfma_scale_f32_32x32x64_f8f6f4
+//     1 wavefront (64 threads), BLOCK_M=32, BLOCK_N=32
+//     64 FP4 per MFMA = 32 packed bytes, 16 float accumulator per thread
+//     Best for: small-K shapes where finer K-splitting fills more CUs
 //
 // Split-K: multiple workgroups can share the same output tile, each computing
 // a partial sum over a K-chunk. Partials are accumulated via atomicAdd.
@@ -15,15 +23,50 @@
 
 #include <hip/hip_runtime.h>
 
-// Vector types required by the MFMA intrinsic on ROCm 7.1.
-// The builtin demands v8i32 operands (256 bits = 64 FP4 values per thread),
-// even though only the lower 4 ints (128 bits) carry data per lane_k_group.
-typedef int __attribute__((ext_vector_type(4))) v4i32;
+// ---- Vector types for MFMA operands and accumulators ----
 typedef int __attribute__((ext_vector_type(8))) v8i32;
 typedef float __attribute__((ext_vector_type(4))) v4f32;
+typedef float __attribute__((ext_vector_type(16))) v16f32;
 
-extern "C"
-__global__ __attribute__((amdgpu_flat_work_group_size(256, 256)))
+// ---- Compile-time configuration based on MFMA_MODE ----
+
+#ifndef MFMA_MODE
+#define MFMA_MODE 0
+#endif
+
+#if MFMA_MODE == 0
+  // 16x16x128: 4 wavefronts per workgroup
+  #define WG_SIZE        256
+  #define BLOCK_M        16
+  #define BLOCK_N        64
+  #define WAVE_N         16
+  #define MFMA_K_BYTES   64      // 128 FP4 / 2 = 64 bytes per MFMA
+  #define ACC_PER_KG     4       // accumulator elements per K-group
+  #define LANE_ROW_SHIFT 4       // log2(16) for lane_k_group = lane_id >> shift
+#elif MFMA_MODE == 1
+  // 32x32x64: 1 wavefront per workgroup
+  #define WG_SIZE        64
+  #define BLOCK_M        32
+  #define BLOCK_N        32
+  #define WAVE_N         32
+  #define MFMA_K_BYTES   32      // 64 FP4 / 2 = 32 bytes per MFMA
+  #define ACC_PER_KG     16      // accumulator elements per K-group
+  #define LANE_ROW_SHIFT 5       // log2(32) for lane_k_group = lane_id >> shift
+#else
+  #error "MFMA_MODE must be 0 (16x16x128) or 1 (32x32x64)"
+#endif
+
+constexpr int SCALE_GROUP_BYTES = 16;   // 32 FP4 / 2 = 16 bytes per E8M0 scale group
+constexpr int GROUP_M = 8;              // L2 swizzle group size along M
+constexpr int TYPE_FP4 = 4;             // MFMA cbsz/blgp selector for E2M1 FP4
+
+// ---- Kernel entry point ----
+
+#if MFMA_MODE == 0
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(256, 256)))
+#else
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(64, 64)))
+#endif
 void mxfp4_gemm_kernel(
     const unsigned char* __restrict__ A,        // [M, K_packed] row-major, FP4 packed 2/byte
     const unsigned char* __restrict__ B,        // [N, K_packed] row-major, FP4 packed 2/byte
@@ -35,34 +78,21 @@ void mxfp4_gemm_kernel(
     const int stride_bsn, const int stride_bsk, // B_scale strides (row, col)
     const int SPLITK_BLOCK, const int NUM_KSPLIT)
 {
-    // ---- Tile dimensions ----
-    constexpr int BLOCK_M = 16;             // M-tiles per workgroup (matches MFMA M)
-    constexpr int BLOCK_N = 64;             // N-tiles per workgroup (4 wavefronts * 16)
-    constexpr int WAVE_N = 16;              // N per wavefront (matches MFMA N)
-    constexpr int MFMA_K_BYTES = 64;        // Bytes consumed per MFMA: 128 FP4 values / 2 = 64 bytes
-    constexpr int SCALE_GROUP_BYTES = 16;   // Bytes per scale group: 32 FP4 values / 2 = 16 bytes
-    constexpr int GROUP_M = 8;              // L2 swizzle group size along M
-    constexpr int TYPE_FP4 = 4;             // MFMA cbsz/blgp selector for E2M1 FP4
-
-    // ---- Thread identity within the workgroup ----
-    // 256 threads = 4 wavefronts. wave_id selects which 16-col sub-tile along N.
-    // Within a wavefront (64 threads), the MFMA maps threads as:
-    //   lane_row    = lane_id % 16  -> which row of the 16x16 tile
-    //   lane_k_group = lane_id / 16 -> which of 4 K-groups (each loads 16 bytes)
-    const int wave_id = threadIdx.x >> 6;       // 0..3
-    const int lane_id = threadIdx.x & 63;       // 0..63
-    const int lane_row = lane_id & 15;          // 0..15: row within 16x16 tile
-    const int lane_k_group = lane_id >> 4;      // 0..3: K-group index
+    // ---- Thread identity ----
+    // wave_id: which wavefront in the workgroup (0 for 32x32, 0..3 for 16x16)
+    // lane_row: which row of the MFMA tile this thread handles
+    // lane_k_group: which K-group this thread belongs to (loads a K-slice)
+    const int wave_id = threadIdx.x >> 6;
+    const int lane_id = threadIdx.x & 63;
+    const int lane_row = lane_id & (BLOCK_M - 1);
+    const int lane_k_group = lane_id >> LANE_ROW_SHIFT;
 
     // ---- Block ID decomposition with L2 swizzle ----
-    // 1D grid is linearized as: pid = pid_k * (num_m * num_n) + pid_mn
-    // L2 swizzle groups GROUP_M consecutive M-tiles together to improve
-    // cache locality for B accesses across adjacent M-tiles.
     const int num_m = (M + BLOCK_M - 1) / BLOCK_M;
     const int num_n = (N + BLOCK_N - 1) / BLOCK_N;
     const int pid = blockIdx.x;
-    const int pid_k = pid % NUM_KSPLIT;         // which K-split chunk
-    const int pid_mn = pid / NUM_KSPLIT;         // which output tile
+    const int pid_k = pid % NUM_KSPLIT;
+    const int pid_mn = pid / NUM_KSPLIT;
 
     const int num_pid_in_group = GROUP_M * num_n;
     const int group_id = pid_mn / num_pid_in_group;
@@ -75,24 +105,21 @@ void mxfp4_gemm_kernel(
     const int pid_n = pid_in / group_size_m;
 
     // ---- Tile coordinates ----
-    const int m_base = pid_m * BLOCK_M;                     // first M-row of this tile
-    const int n_sub = pid_n * BLOCK_N + wave_id * WAVE_N;   // first N-col for this wavefront
+    const int m_base = pid_m * BLOCK_M;
+    const int n_sub = pid_n * BLOCK_N + wave_id * WAVE_N;
 
     if (m_base >= M || n_sub >= N) return;
 
     // ---- Per-thread data pointers ----
-    // Each thread is responsible for one row of A (row = m_base + lane_row)
-    // and one row of B (row = n_sub + lane_row). "Row" in B corresponds to
-    // a column of the logical B^T, i.e. we compute A @ B^T.
     const int a_row = m_base + lane_row;
     const int b_row = n_sub + lane_row;
     const bool a_valid = (a_row < M);
     const bool b_valid = (b_row < N);
 
-    const long long a_row_off = (long long)a_row * K_packed;   // byte offset to start of A row
-    const long long b_row_off = (long long)b_row * K_packed;   // byte offset to start of B row
-    const int a_scale_row_off = a_row * stride_asm;            // scale offset for A row
-    const int b_scale_row_off = b_row * stride_bsn;            // scale offset for B row
+    const long long a_row_off = (long long)a_row * K_packed;
+    const long long b_row_off = (long long)b_row * K_packed;
+    const int a_scale_row_off = a_row * stride_asm;
+    const int b_scale_row_off = b_row * stride_bsn;
 
     // ---- Split-K range ----
     const int k_start = pid_k * SPLITK_BLOCK;
@@ -100,17 +127,25 @@ void mxfp4_gemm_kernel(
     if (k_end > K_packed) k_end = K_packed;
 
     // ---- Accumulator ----
-    // MFMA 16x16 produces 4 float outputs per thread (v4f32).
+    // 16x16 → 4 floats per thread (v4f32)
+    // 32x32 → 16 floats per thread (v16f32)
+#if MFMA_MODE == 0
     v4f32 acc;
     acc[0] = 0.0f; acc[1] = 0.0f; acc[2] = 0.0f; acc[3] = 0.0f;
+#else
+    v16f32 acc;
+    acc[0]  = 0.0f; acc[1]  = 0.0f; acc[2]  = 0.0f; acc[3]  = 0.0f;
+    acc[4]  = 0.0f; acc[5]  = 0.0f; acc[6]  = 0.0f; acc[7]  = 0.0f;
+    acc[8]  = 0.0f; acc[9]  = 0.0f; acc[10] = 0.0f; acc[11] = 0.0f;
+    acc[12] = 0.0f; acc[13] = 0.0f; acc[14] = 0.0f; acc[15] = 0.0f;
+#endif
 
     // ---- Main K loop ----
-    // Each iteration feeds one MFMA instruction: 128 FP4 values = 64 packed bytes.
-    // Each thread loads 16 bytes (32 FP4 values) from its lane_k_group slice.
+    // Each thread loads 16 bytes (4 × int32 = 32 FP4 values) from its K-group slice.
+    // Both MFMA variants use v8i32 operands; only the lower 4 ints carry data.
     for (int k = k_start; k < k_end; k += MFMA_K_BYTES) {
 
-        // Load 16 bytes of A data for this thread's row and K-group.
-        // Layout: A[row, k + lane_k_group*16 .. +16] as 4 x int32.
+        // Load A data: A[a_row, k + lane_k_group*16 .. +16]
         v8i32 a_reg;
         a_reg[0] = 0; a_reg[1] = 0; a_reg[2] = 0; a_reg[3] = 0;
         a_reg[4] = 0; a_reg[5] = 0; a_reg[6] = 0; a_reg[7] = 0;
@@ -124,7 +159,7 @@ void mxfp4_gemm_kernel(
             a_reg[3] = a_src[3];
         }
 
-        // Load 16 bytes of B data similarly.
+        // Load B data: B[b_row, k + lane_k_group*16 .. +16]
         v8i32 b_reg;
         b_reg[0] = 0; b_reg[1] = 0; b_reg[2] = 0; b_reg[3] = 0;
         b_reg[4] = 0; b_reg[5] = 0; b_reg[6] = 0; b_reg[7] = 0;
@@ -139,9 +174,9 @@ void mxfp4_gemm_kernel(
         }
 
         // Load E8M0 block scales.
-        // Each scale covers 32 FP4 values = 16 packed bytes. The MFMA consumes
-        // 128 FP4 = 4 scale groups, and each lane_k_group handles one group.
-        // Default 127 = E8M0 exponent for 2^0 = 1.0 (neutral scale for OOB).
+        // Each scale covers 32 FP4 = 16 packed bytes. The number of scale groups
+        // per MFMA depends on the variant (4 for 16x16, 2 for 32x32), and each
+        // lane_k_group handles one group. Default 127 = 2^0 (neutral scale).
         const int k_scale_col = k / SCALE_GROUP_BYTES + lane_k_group;
 
         unsigned int scale_a_val = 127;
@@ -151,9 +186,12 @@ void mxfp4_gemm_kernel(
         if (b_valid)
             scale_b_val = (unsigned int)B_scale[b_scale_row_off + k_scale_col * stride_bsk];
 
-        // Execute the MFMA: 16x16 matmul over 128 FP4 elements with block scaling.
-        // cbsz=4, blgp=4 select E2M1 FP4 for both A and B operands.
+        // Execute MFMA with block scaling. cbsz=4, blgp=4 select E2M1 FP4.
+#if MFMA_MODE == 0
         acc = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+#else
+        acc = __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(
+#endif
             a_reg, b_reg, acc,
             /*cbsz*/ TYPE_FP4,
             /*blgp*/ TYPE_FP4,
@@ -165,20 +203,22 @@ void mxfp4_gemm_kernel(
     }
 
     // ---- Store output ----
-    // MFMA 16x16x128 output mapping (gfx950 FP4 variant):
-    //   acc[j] of thread (lane_row, lane_k_group) -> C[4*lane_k_group + j, lane_row]
-    // This is TRANSPOSED from the standard expectation of C[lane_row, 4*lane_k_group + j].
-    // Discovered empirically — the M and N roles are swapped in the output register layout.
+    // Output mapping (transposed, interleaved in groups of 4 rows):
+    //   acc[j] → C[m_base + 8*(j/4) + (j%4) + 4*lane_k_group, n_sub + lane_row]
+    //
+    // For 16x16 (j=0..3): simplifies to row = 4*lane_kg + j (verified empirically)
+    // For 32x32 (j=0..15): interleaves — kg=0 gets rows {0-3,8-11,16-19,24-27},
+    //                                     kg=1 gets rows {4-7,12-15,20-23,28-31}
     const int c_col = n_sub + lane_row;
     if (c_col < N) {
-        for (int j = 0; j < 4; j++) {
-            const int c_row = m_base + 4 * lane_k_group + j;
+        for (int j = 0; j < ACC_PER_KG; j++) {
+            const int c_row = m_base + 8 * (j / 4) + (j % 4) + 4 * lane_k_group;
             if (c_row < M) {
                 float* c_ptr = C + (long long)c_row * N + c_col;
                 if (NUM_KSPLIT > 1)
-                    atomicAdd(c_ptr, acc[j]);   // multiple K-splits accumulate atomically
+                    atomicAdd(c_ptr, acc[j]);
                 else
-                    *c_ptr = acc[j];            // single K-split: direct write
+                    *c_ptr = acc[j];
             }
         }
     }

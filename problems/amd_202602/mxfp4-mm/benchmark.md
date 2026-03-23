@@ -1,27 +1,17 @@
-Let's compare with our mxfp4-mm benchmark shapes:
+# CU saturation analysis (BLOCK_M=16, BLOCK_N=64, MI355X = 1,024 CUs)
 
-┌───────────────────┬──────────────────────┬────────────────┬────────────┐
-│   Shape (MxNxK)   │ Output tiles (32x32) │ vs 1,024 cores │ Saturation │
-├───────────────────┼──────────────────────┼────────────────┼────────────┤
-│ 4 × 2880 × 512    │ 1 × 90 = 90          │ 8.8%           │ Very low   │
-├───────────────────┼──────────────────────┼────────────────┼────────────┤
-│ 16 × 2112 × 7168  │ 1 × 66 = 66          │ 6.4%           │ Very low   │
-├───────────────────┼──────────────────────┼────────────────┼────────────┤
-│ 32 × 4096 × 512   │ 1 × 128 = 128        │ 12.5%          │ Low        │
-├───────────────────┼──────────────────────┼────────────────┼────────────┤
-│ 32 × 2880 × 512   │ 1 × 90 = 90          │ 8.8%           │ Low        │
-├───────────────────┼──────────────────────┼────────────────┼────────────┤
-│ 64 × 7168 × 2048  │ 2 × 224 = 448        │ 43.8%          │ Medium     │
-├───────────────────┼──────────────────────┼────────────────┼────────────┤
-│ 256 × 3072 × 1536 │ 8 × 96 = 768         │ 75%            │ Decent     │
-└───────────────────┴──────────────────────┴────────────────┴────────────┘
+| Shape (M×N×K) | M tiles | N tiles | Output tiles | vs 1,024 CUs | Saturation |
+|----------------|---------|---------|--------------|--------------|------------|
+| 4 × 2880 × 512 | 1 | 45 | 45 | 4.4% | Very low |
+| 16 × 2112 × 7168 | 1 | 33 | 33 | 3.2% | Very low |
+| 32 × 4096 × 512 | 2 | 64 | 128 | 12.5% | Low |
+| 32 × 2880 × 512 | 2 | 45 | 90 | 8.8% | Low |
+| 64 × 7168 × 2048 | 4 | 112 | 448 | 43.8% | Medium |
+| 256 × 3072 × 1536 | 16 | 48 | 768 | 75.0% | Decent |
 
-Every shape is undersaturated — especially the small-M cases where M=4 or M=16 produces only 1 row of tiles. The chip is mostly idle.
-
-This is why:
-1. Our benchmarks are 2x slower than the tuned reference — the default kernel doesn't compensate for this
-2. Split-K is critical for these shapes — it creates extra blocks by parallelizing the K reduction, trading more blocks for a final reduction step
-3. For M=4, K=512: splitting K into 8 chunks gives 8 × 90 = 720 blocks instead of 90
+Every shape is undersaturated — especially the small-M cases where M=4 or M=16
+produces only 1 row of M-tiles. Split-K is critical: it multiplies the grid by
+NUM_KSPLIT to fill more CUs, at the cost of an atomic reduction.
 
 
 # mxfp4-mm Reference Benchmark (aiter gemm_a4w4 on MI355X)
@@ -86,8 +76,62 @@ BLOCK_M=16, BLOCK_N=64, 4 wavefronts per workgroup, atomic float32 split-K.
 | 64 | 7168 | 2048 | 39.5 µs | 38.2 µs | 44.2 µs | 1.63x | 0.71x |
 | 256 | 3072 | 1536 | 36.4 µs | 35.2 µs | 43.4 µs | 1.58x | 1.14x |
 
+## HIP kernel CU saturation with split-K
+
+Split-K formula: `num_ksplit = min(16, max(1, 1024 // output_tiles))`,
+then aligned to BLOCK_K=128 bytes. Grid = actual_ksplit × output_tiles.
+
+| Shape (M×N×K) | Output tiles | Requested K-split | Actual K-split | Grid size | vs 1,024 CUs | Saturation |
+|----------------|-------------|-------------------|----------------|-----------|--------------|------------|
+| 4 × 2880 × 512 | 45 | 16 | 2 | 90 | 8.8% | Very low |
+| 16 × 2112 × 7168 | 33 | 16 | 14 | 462 | 45.1% | Medium |
+| 32 × 4096 × 512 | 128 | 8 | 2 | 256 | 25.0% | Low |
+| 32 × 2880 × 512 | 90 | 11 | 2 | 180 | 17.6% | Low |
+| 64 × 7168 × 2048 | 448 | 2 | 2 | 896 | 87.5% | Good |
+| 256 × 3072 × 1536 | 768 | 1 | 1 | 768 | 75.0% | Decent |
+
+Small-K shapes (K=512) can only split to 2 because K_packed=256 aligned to
+BLOCK_K=128 gives at most 2 chunks. The 16×2112×7168 shape benefits most from
+split-K (14-way), which explains why it beats the reference despite low base tiles.
+
 **Key observations:**
 - Beats Triton significantly on high-K shapes (16×2112×7168: 2x faster, 64×7168×2048: 1.4x faster)
-- 16×2112×7168 actually beats the aiter reference (0.82x)
-- Slower on large-tile shapes (M=256) — likely due to naive global memory access pattern
-- Next step: LDS-based intra-workgroup K reduction to eliminate atomics
+- 16×2112×7168 actually beats the aiter reference (0.82x) — high K-split fills CUs well
+- Slower on large-tile shapes (M=256) — no split-K benefit, naive global memory access pattern
+
+# Dual MFMA Kernel (16x16x128 + 32x32x64, per-shape dispatch)
+
+Uses both MFMA variants compiled via HIPRTC with `-DMFMA_MODE=N`:
+- Mode 0: `mfma_scale_f32_16x16x128` (256 threads, BLOCK_M=16, BLOCK_N=64)
+- Mode 1: `mfma_scale_f32_32x32x64`  (64 threads,  BLOCK_M=32, BLOCK_N=32)
+
+32x32 output mapping: interleaved 4-row groups — `row = 8*(j/4) + (j%4) + 4*lane_kg`.
+This is a unified formula: for 16x16 (j=0..3) it simplifies to `4*kg + j`.
+
+| M | N | K | Mode | Mean | Best | Worst | vs Reference | vs v1 HIP |
+|---|------|------|------|------|------|-------|-------------|-----------|
+| 4 | 2880 | 512 | 32x32 | 20.4 µs | 19.6 µs | 25.2 µs | 1.05x | 1.00x |
+| 16 | 2112 | 7168 | 16x16 | 28.7 µs | 27.5 µs | 33.3 µs | 0.86x | 1.04x |
+| 32 | 4096 | 512 | 32x32 | 23.3 µs | 22.4 µs | 29.4 µs | 1.18x | 1.09x |
+| 32 | 2880 | 512 | 32x32 | 22.2 µs | 21.4 µs | 27.3 µs | 1.12x | 1.07x |
+| 64 | 7168 | 2048 | 16x16 | 39.3 µs | 38.2 µs | 43.9 µs | 1.62x | 0.99x |
+| 256 | 3072 | 1536 | 16x16 | 36.2 µs | 35.1 µs | 41.3 µs | 1.57x | 1.00x |
+
+## Dual kernel CU saturation
+
+Per-shape config with optimal MFMA mode and split-K:
+
+| Shape (M×N×K) | Mode | Tiles | K-split | Grid | vs 1,024 CUs | Saturation |
+|----------------|------|-------|---------|------|--------------|------------|
+| 4 × 2880 × 512 | 32x32 | 90 | 8 | 720 | 70.3% | Good |
+| 16 × 2112 × 7168 | 16x16 | 33 | 28 | 924 | 90.2% | Excellent |
+| 32 × 4096 × 512 | 32x32 | 128 | 8 | 1024 | 100% | Full |
+| 32 × 2880 × 512 | 32x32 | 90 | 8 | 720 | 70.3% | Good |
+| 64 × 7168 × 2048 | 16x16 | 448 | 2 | 896 | 87.5% | Excellent |
+| 256 × 3072 × 1536 | 16x16 | 768 | 1 | 768 | 75.0% | Good |
+
+**Result:** The 32x32 mode didn't improve timing for K=512 shapes despite much higher CU
+saturation (70-100% vs 9-25%). The 32x32 shapes are actually slightly slower than v1.
+This suggests the bottleneck is NOT CU saturation but rather atomic contention or memory
+bandwidth per-output-element. With 8 K-splits, each output element gets 8 atomic adds,
+which may serialize in L2 cache. The 16x16 mode shapes are unchanged as expected.
