@@ -135,3 +135,41 @@ saturation (70-100% vs 9-25%). The 32x32 shapes are actually slightly slower tha
 This suggests the bottleneck is NOT CU saturation but rather atomic contention or memory
 bandwidth per-output-element. With 8 K-splits, each output element gets 8 atomic adds,
 which may serialize in L2 cache. The 16x16 mode shapes are unchanged as expected.
+
+# LDS Intra-Workgroup Reduction (v3, 16x16x128 + INTRA_K_SPLITS)
+
+Replaces external split-K (multiple WGs + atomicAdd) with intra-workgroup K-splitting
+where multiple wavefronts within a single WG each process a K-chunk, then reduce via LDS.
+Only k_wave=0 writes to global memory — no atomics needed when external NUM_KSPLIT=1.
+
+Compile-time define: `-DINTRA_K_SPLITS=N` (1, 2, or 4).
+WG size = N_WAVES × INTRA_K_SPLITS × 64 threads.
+
+| M | N | K | IKS | Ext-K | Mean | Best | Worst | vs Reference | vs v2 Dual |
+|---|------|------|-----|-------|------|------|-------|-------------|------------|
+| 4 | 2880 | 512 | 4 | 1 | 19.0 µs | 18.2 µs | 25.6 µs | 0.98x | 0.93x |
+| 16 | 2112 | 7168 | 1 | 28 | 28.4 µs | 27.4 µs | 35.2 µs | 0.85x | 0.99x |
+| 32 | 4096 | 512 | 4 | 1 | 19.6 µs | 18.8 µs | 27.1 µs | 0.99x | 0.84x |
+| 32 | 2880 | 512 | 4 | 1 | 19.6 µs | 18.7 µs | 27.9 µs | 0.98x | 0.88x |
+| 64 | 7168 | 2048 | 1 | 2 | 39.5 µs | 38.3 µs | 44.3 µs | 1.63x | 1.01x |
+| 256 | 3072 | 1536 | 1 | 1 | 36.4 µs | 35.2 µs | 41.0 µs | 1.58x | 1.01x |
+
+## LDS kernel CU saturation
+
+| Shape (M×N×K) | Mode | Tiles | IKS | Ext-K | WG threads | Grid | Saturation |
+|----------------|------|-------|-----|-------|------------|------|------------|
+| 4 × 2880 × 512 | 16x16 | 45 | 4 | 1 | 1024 | 45 | 4.4% |
+| 16 × 2112 × 7168 | 16x16 | 33 | 1 | 28 | 256 | 924 | 90.2% |
+| 32 × 4096 × 512 | 16x16 | 128 | 4 | 1 | 1024 | 128 | 12.5% |
+| 32 × 2880 × 512 | 16x16 | 90 | 4 | 1 | 1024 | 90 | 8.8% |
+| 64 × 7168 × 2048 | 16x16 | 448 | 1 | 2 | 256 | 896 | 87.5% |
+| 256 × 3072 × 1536 | 16x16 | 768 | 1 | 1 | 256 | 768 | 75.0% |
+
+**Key findings:**
+- K=512 shapes improved 16-19% vs v2 Dual (32x32+atomics), now matching reference
+- LDS reduction eliminates all atomics for K=512 shapes (ext-K=1, single write)
+- Low CU saturation (4-13%) for K=512 shapes doesn't hurt — confirms the bottleneck
+  was atomic contention, not CU fill. 45 WGs × 1024 threads still keeps CUs busy
+- High-K shapes (K=7168, 2048) unchanged — still using external split-K with atomics
+- M=256, M=64 still 1.58-1.63x slower than reference — different bottleneck (likely
+  memory access pattern or occupancy)

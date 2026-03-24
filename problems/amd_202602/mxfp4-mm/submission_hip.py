@@ -2,7 +2,8 @@
 #!POPCORN gpu MI355X
 """
 HIP C++ MXFP4 GEMM kernel for MI355X (gfx950) using HIPRTC.
-Dual MFMA variant: 16x16x128 or 32x32x64, selected per-shape for optimal CU fill.
+Dual MFMA variant: 16x16x128 or 32x32x64, selected per-shape.
+Intra-workgroup K-splitting with LDS reduction to eliminate atomics.
 
 Kernel source lives in mxfp4_gemm_kernel.hip for readability.
 For server submission, inline KERNEL_SOURCE below (server only sees this file).
@@ -35,7 +36,7 @@ typedef float __attribute__((ext_vector_type(16))) v16f32;
 #endif
 
 #if MFMA_MODE == 0
-  #define WG_SIZE        256
+  #define N_WAVES        4
   #define BLOCK_M        16
   #define BLOCK_N        64
   #define WAVE_N         16
@@ -43,7 +44,7 @@ typedef float __attribute__((ext_vector_type(16))) v16f32;
   #define ACC_PER_KG     4
   #define LANE_ROW_SHIFT 4
 #elif MFMA_MODE == 1
-  #define WG_SIZE        64
+  #define N_WAVES        1
   #define BLOCK_M        32
   #define BLOCK_N        32
   #define WAVE_N         32
@@ -54,14 +55,32 @@ typedef float __attribute__((ext_vector_type(16))) v16f32;
   #error "MFMA_MODE must be 0 or 1"
 #endif
 
+#ifndef INTRA_K_SPLITS
+#define INTRA_K_SPLITS 1
+#endif
+
+#define TOTAL_WAVES   (N_WAVES * INTRA_K_SPLITS)
+#define TOTAL_WG_SIZE (TOTAL_WAVES * 64)
+
+#define LDS_ELEMS_PER_NWAVE (64 * ACC_PER_KG)
+#define LDS_TOTAL ((INTRA_K_SPLITS - 1) * N_WAVES * LDS_ELEMS_PER_NWAVE)
+
 constexpr int SCALE_GROUP_BYTES = 16;
 constexpr int GROUP_M = 8;
 constexpr int TYPE_FP4 = 4;
 
-#if MFMA_MODE == 0
-extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(256, 256)))
-#else
+#if TOTAL_WG_SIZE == 64
 extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(64, 64)))
+#elif TOTAL_WG_SIZE == 128
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128)))
+#elif TOTAL_WG_SIZE == 256
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(256, 256)))
+#elif TOTAL_WG_SIZE == 512
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(512, 512)))
+#elif TOTAL_WG_SIZE == 1024
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(1024, 1024)))
+#else
+extern "C" __global__
 #endif
 void mxfp4_gemm_kernel(
     const unsigned char* __restrict__ A,
@@ -74,9 +93,11 @@ void mxfp4_gemm_kernel(
     const int stride_bsn, const int stride_bsk,
     const int SPLITK_BLOCK, const int NUM_KSPLIT)
 {
-    const int wave_id = threadIdx.x >> 6;
-    const int lane_id = threadIdx.x & 63;
-    const int lane_row = lane_id & (BLOCK_M - 1);
+    const int global_wave = threadIdx.x >> 6;
+    const int lane_id     = threadIdx.x & 63;
+    const int n_wave      = global_wave % N_WAVES;
+    const int k_wave      = global_wave / N_WAVES;
+    const int lane_row    = lane_id & (BLOCK_M - 1);
     const int lane_k_group = lane_id >> LANE_ROW_SHIFT;
 
     const int num_m = (M + BLOCK_M - 1) / BLOCK_M;
@@ -96,7 +117,7 @@ void mxfp4_gemm_kernel(
     const int pid_n = pid_in / group_size_m;
 
     const int m_base = pid_m * BLOCK_M;
-    const int n_sub = pid_n * BLOCK_N + wave_id * WAVE_N;
+    const int n_sub  = pid_n * BLOCK_N + n_wave * WAVE_N;
 
     if (m_base >= M || n_sub >= N) return;
 
@@ -110,9 +131,21 @@ void mxfp4_gemm_kernel(
     const int a_scale_row_off = a_row * stride_asm;
     const int b_scale_row_off = b_row * stride_bsn;
 
-    const int k_start = pid_k * SPLITK_BLOCK;
-    int k_end = k_start + SPLITK_BLOCK;
-    if (k_end > K_packed) k_end = K_packed;
+    const int wg_k_start = pid_k * SPLITK_BLOCK;
+    int wg_k_end = wg_k_start + SPLITK_BLOCK;
+    if (wg_k_end > K_packed) wg_k_end = K_packed;
+
+#if INTRA_K_SPLITS > 1
+    const int wg_k_range = wg_k_end - wg_k_start;
+    const int k_per_wave = ((wg_k_range + INTRA_K_SPLITS * MFMA_K_BYTES - 1)
+                            / (INTRA_K_SPLITS * MFMA_K_BYTES)) * MFMA_K_BYTES;
+    const int k_start = wg_k_start + k_wave * k_per_wave;
+    int k_end = k_start + k_per_wave;
+    if (k_end > wg_k_end) k_end = wg_k_end;
+#else
+    const int k_start = wg_k_start;
+    const int k_end   = wg_k_end;
+#endif
 
 #if MFMA_MODE == 0
     v4f32 acc;
@@ -166,6 +199,33 @@ void mxfp4_gemm_kernel(
         );
     }
 
+#if INTRA_K_SPLITS > 1
+    __shared__ float lds_partial[LDS_TOTAL];
+
+    if (k_wave > 0) {
+        const int lds_base = (k_wave - 1) * N_WAVES * LDS_ELEMS_PER_NWAVE
+                           + n_wave * LDS_ELEMS_PER_NWAVE
+                           + lane_id * ACC_PER_KG;
+        for (int j = 0; j < ACC_PER_KG; j++)
+            lds_partial[lds_base + j] = acc[j];
+    }
+    __syncthreads();
+
+    if (k_wave == 0) {
+        for (int kk = 0; kk < INTRA_K_SPLITS - 1; kk++) {
+            const int lds_base = kk * N_WAVES * LDS_ELEMS_PER_NWAVE
+                               + n_wave * LDS_ELEMS_PER_NWAVE
+                               + lane_id * ACC_PER_KG;
+            for (int j = 0; j < ACC_PER_KG; j++)
+                acc[j] += lds_partial[lds_base + j];
+        }
+    }
+#endif
+
+#if INTRA_K_SPLITS > 1
+    if (k_wave != 0) return;
+#endif
+
     const int c_col = n_sub + lane_row;
     if (c_col < N) {
         for (int j = 0; j < ACC_PER_KG; j++) {
@@ -195,11 +255,11 @@ KERNEL_SOURCE = _load_kernel_source()
 # MFMA mode parameters
 # ============================================================================
 
-# Mode 0: mfma_scale_f32_16x16x128 — 4 wavefronts (256 threads)
-# Mode 1: mfma_scale_f32_32x32x64  — 1 wavefront  (64 threads)
+# Mode 0: mfma_scale_f32_16x16x128 — N_WAVES=4 wavefronts
+# Mode 1: mfma_scale_f32_32x32x64  — N_WAVES=1 wavefront
 _MFMA_PARAMS = {
-    0: {'block_m': 16, 'block_n': 64, 'wg_size': 256, 'mfma_k_bytes': 64},
-    1: {'block_m': 32, 'block_n': 32, 'wg_size': 64,  'mfma_k_bytes': 32},
+    0: {'block_m': 16, 'block_n': 64, 'n_waves': 4, 'mfma_k_bytes': 64},
+    1: {'block_m': 32, 'block_n': 32, 'n_waves': 1, 'mfma_k_bytes': 32},
 }
 
 # ============================================================================
@@ -208,7 +268,7 @@ _MFMA_PARAMS = {
 
 _hip = None
 _hiprtc = None
-_kernel_funcs: dict = {}  # mfma_mode -> compiled kernel function
+_kernel_funcs: dict = {}  # (mfma_mode, intra_k_splits) -> compiled kernel function
 
 
 def _init_libs():
@@ -240,9 +300,10 @@ def _init_libs():
     ]
 
 
-def _compile_kernel(mfma_mode=0):
-    if mfma_mode in _kernel_funcs:
-        return _kernel_funcs[mfma_mode]
+def _compile_kernel(mfma_mode=0, intra_k_splits=1):
+    key = (mfma_mode, intra_k_splits)
+    if key in _kernel_funcs:
+        return _kernel_funcs[key]
 
     _init_libs()
 
@@ -259,6 +320,7 @@ def _compile_kernel(mfma_mode=0):
         b"--offload-arch=gfx950",
         b"-O3",
         f"-DMFMA_MODE={mfma_mode}".encode("utf-8"),
+        f"-DINTRA_K_SPLITS={intra_k_splits}".encode("utf-8"),
     ]
     opts_arr = (_ct.c_char_p * len(opts))(*opts)
     err = _hiprtc.hiprtcCompileProgram(prog, len(opts), opts_arr)
@@ -267,7 +329,7 @@ def _compile_kernel(mfma_mode=0):
         _hiprtc.hiprtcGetProgramLogSize(prog, _ct.byref(log_size))
         log_buf = _ct.create_string_buffer(log_size.value)
         _hiprtc.hiprtcGetProgramLog(prog, log_buf)
-        raise RuntimeError(f"HIPRTC compile failed (mode={mfma_mode}, err={err}):\n{log_buf.value.decode()}")
+        raise RuntimeError(f"HIPRTC compile failed (mode={mfma_mode}, iks={intra_k_splits}, err={err}):\n{log_buf.value.decode()}")
 
     code_size = _ct.c_size_t()
     _hiprtc.hiprtcGetCodeSize(prog, _ct.byref(code_size))
@@ -284,11 +346,11 @@ def _compile_kernel(mfma_mode=0):
     )
     assert err == 0, f"hipModuleGetFunction failed: {err}"
 
-    _kernel_funcs[mfma_mode] = func
+    _kernel_funcs[key] = func
     return func
 
 
-def _launch_kernel(func, grid_x, wg_size,
+def _launch_kernel(func, grid_x, wg_size, lds_bytes,
                    A, B, C, A_scale, B_scale,
                    M, N, K_packed,
                    stride_asm, stride_ask, stride_bsn, stride_bsk,
@@ -322,7 +384,7 @@ def _launch_kernel(func, grid_x, wg_size,
         func,
         grid_x, 1, 1,
         wg_size, 1, 1,
-        0,
+        lds_bytes,
         s_handle,
         params,
         None,
@@ -335,11 +397,12 @@ def _launch_kernel(func, grid_x, wg_size,
 # ============================================================================
 
 def mxfp4_gemm_hip(A_q, B_q, A_scale, B_scale, M, N, K,
-                    num_ksplit=1, mfma_mode=0, BLOCK_K=64):
+                    num_ksplit=1, mfma_mode=0, intra_k_splits=1, BLOCK_K=64):
     params = _MFMA_PARAMS[mfma_mode]
     block_m = params['block_m']
     block_n = params['block_n']
-    wg_size = params['wg_size']
+    n_waves = params['n_waves']
+    wg_size = n_waves * intra_k_splits * 64
 
     K_packed = K // 2
 
@@ -361,9 +424,9 @@ def mxfp4_gemm_hip(A_q, B_q, A_scale, B_scale, M, N, K,
     num_n = (N + block_n - 1) // block_n
     grid_x = actual_ksplit * num_m * num_n
 
-    func = _compile_kernel(mfma_mode)
+    func = _compile_kernel(mfma_mode, intra_k_splits)
     _launch_kernel(
-        func, grid_x, wg_size,
+        func, grid_x, wg_size, 0,
         A_u8, B_u8, c_out, A_sc, B_sc,
         M, N, K_packed,
         A_sc.stride(0), A_sc.stride(1),
@@ -399,25 +462,30 @@ def custom_kernel(data: input_t) -> output_t:
     B_scale = _b_scale_cache[b_key][1]
 
     # Per-shape configs targeting ~1024 CUs on MI355X.
-    # (M, N, K) -> (num_ksplit, block_k, mfma_mode)
-    #   mfma_mode 0: 16x16x128 (256 threads, BLOCK_M=16, BLOCK_N=64)
-    #   mfma_mode 1: 32x32x64  (64 threads,  BLOCK_M=32, BLOCK_N=32)
+    # (M, N, K) -> (num_ksplit, block_k, mfma_mode, intra_k_splits)
+    #   mfma_mode 0: 16x16x128 (N_WAVES=4, BLOCK_M=16, BLOCK_N=64)
+    #   mfma_mode 1: 32x32x64  (N_WAVES=1, BLOCK_M=32, BLOCK_N=32)
+    #   intra_k_splits: wavefronts within WG splitting K, reduced via LDS
+    #
+    # Strategy: use intra_k_splits to fill CUs for small-K shapes (eliminates atomics),
+    # use external split-K (num_ksplit>1) only when K is large enough.
     _SHAPE_CONFIGS = {
-        #                     ksplit  blk_k  mode    grid    saturation
-        (4, 2880, 512):     (8,     32,    1),   # 720,    70.3%
-        (16, 2112, 7168):   (28,    64,    0),   # 924,    90.2%
-        (32, 4096, 512):    (8,     32,    1),   # 1024,   100%
-        (32, 2880, 512):    (8,     32,    1),   # 720,    70.3%
-        (64, 7168, 2048):   (2,     64,    0),   # 896,    87.5%
-        (256, 3072, 1536):  (1,     64,    0),   # 768,    75.0%
+        #                     ksplit  blk_k  mode  iks
+        (4, 2880, 512):     (1,     64,    0,    4),   # 45 tiles × 4 iks → 180 WGs (4×256 threads)
+        (16, 2112, 7168):   (28,    64,    0,    1),   # 33 tiles × 28 ext → 924 WGs
+        (32, 4096, 512):    (1,     64,    0,    4),   # 128 tiles × 4 iks → 128 WGs (4×1024 threads)
+        (32, 2880, 512):    (1,     64,    0,    4),   # 90 tiles × 4 iks → 90 WGs (4×1024 threads)
+        (64, 7168, 2048):   (2,     64,    0,    1),   # 448 tiles × 2 ext → 896 WGs
+        (256, 3072, 1536):  (1,     64,    0,    1),   # 768 tiles → 768 WGs
     }
 
     cfg = _SHAPE_CONFIGS.get((m, n, k))
     if cfg is not None:
-        num_ksplit, block_k, mfma_mode = cfg
+        num_ksplit, block_k, mfma_mode, intra_k_splits = cfg
     else:
-        # Fallback heuristic for unknown shapes: use 16x16 mode
+        # Fallback heuristic for unknown shapes: use 16x16 mode, no intra-K
         mfma_mode = 0
+        intra_k_splits = 1
         p = _MFMA_PARAMS[mfma_mode]
         output_tiles = triton.cdiv(m, p['block_m']) * triton.cdiv(n, p['block_n'])
         num_ksplit = min(16, max(1, 1024 // output_tiles))
@@ -425,5 +493,6 @@ def custom_kernel(data: input_t) -> output_t:
 
     return mxfp4_gemm_hip(
         A_q.view(torch.uint8), B_q.view(torch.uint8), A_scale, B_scale, m, n, k,
-        num_ksplit=num_ksplit, mfma_mode=mfma_mode, BLOCK_K=block_k,
+        num_ksplit=num_ksplit, mfma_mode=mfma_mode,
+        intra_k_splits=intra_k_splits, BLOCK_K=block_k,
     )
