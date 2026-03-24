@@ -471,10 +471,10 @@ def custom_kernel(data: input_t) -> output_t:
     # use external split-K (num_ksplit>1) only when K is large enough.
     _SHAPE_CONFIGS = {
         #                     ksplit  blk_k  mode  iks
-        (4, 2880, 512):     (1,     64,    0,    4),   # 45 tiles × 4 iks → 180 WGs (4×256 threads)
-        (16, 2112, 7168):   (28,    64,    0,    1),   # 33 tiles × 28 ext → 924 WGs
-        (32, 4096, 512):    (1,     64,    0,    4),   # 128 tiles × 4 iks → 128 WGs (4×1024 threads)
-        (32, 2880, 512):    (1,     64,    0,    4),   # 90 tiles × 4 iks → 90 WGs (4×1024 threads)
+        (4, 2880, 512):     (1,     32,    1,    8),   # 90 tiles, iks=8, WG=512, no atomics
+        (16, 2112, 7168):   (16,    32,    1,    1),   # 66 tiles × 16 ext → 1056 WGs
+        (32, 4096, 512):    (1,     64,    0,    4),   # 128 tiles, iks=4, WG=1024, no atomics
+        (32, 2880, 512):    (1,     32,    1,    8),   # 90 tiles, iks=8, WG=512, no atomics
         (64, 7168, 2048):   (2,     64,    0,    1),   # 448 tiles × 2 ext → 896 WGs
         (256, 3072, 1536):  (1,     64,    0,    1),   # 768 tiles → 768 WGs
     }

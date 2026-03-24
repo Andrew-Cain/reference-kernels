@@ -173,3 +173,23 @@ WG size = N_WAVES × INTRA_K_SPLITS × 64 threads.
 - High-K shapes (K=7168, 2048) unchanged — still using external split-K with atomics
 - M=256, M=64 still 1.58-1.63x slower than reference — different bottleneck (likely
   memory access pattern or occupancy)
+
+# LDS + 32x32 Mode for Selected Shapes (v4)
+
+Switched 4×2880×512, 16×2112×7168, and 32×2880×512 to 32x32 mode with LDS reduction
+(no atomic contention since LDS handles the intra-WG reduce).
+
+| M | N | K | Mode | IKS | Ext-K | Mean | Best | Worst | vs Reference | vs v3 LDS |
+|---|------|------|------|-----|-------|------|------|-------|-------------|-----------|
+| 4 | 2880 | 512 | 32x32 | 8 | 1 | 19.2 µs | 18.5 µs | 29.6 µs | 0.99x | +1% |
+| 16 | 2112 | 7168 | 32x32 | 1 | 16 | 27.7 µs | 26.6 µs | 32.8 µs | 0.83x | -2.5% |
+| 32 | 4096 | 512 | 16x16 | 4 | 1 | 19.7 µs | 18.8 µs | 26.9 µs | 0.99x | 0% |
+| 32 | 2880 | 512 | 32x32 | 8 | 1 | 22.1 µs | 22.1 µs | 22.2 µs | 1.11x | +13% |
+| 64 | 7168 | 2048 | 16x16 | 1 | 2 | 39.1 µs | 38.0 µs | 46.8 µs | 1.62x | -1% |
+| 256 | 3072 | 1536 | 16x16 | 1 | 1 | 36.2 µs | 35.1 µs | 41.7 µs | 1.57x | -1% |
+
+**Result:** Mixed. 16×2112×7168 improved (27.7 vs 28.4 µs, now 0.83x reference).
+32×2880×512 regressed (22.1 vs 19.6 µs). The 16x16 MFMA processes 2x more K per
+instruction (64 bytes vs 32 bytes), so for K=512 shapes it's more compute-efficient.
+32x32 mode benefits the high-K shape where more external K-splits fill CUs better
+(66 tiles × 16 ext-K = 1056 WGs vs 33 tiles × 28 ext-K = 924 WGs).
