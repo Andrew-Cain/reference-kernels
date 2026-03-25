@@ -15,6 +15,10 @@
 //     1 — no intra-WG reduction (uses external split-K with atomicAdd)
 //     2,4 — wavefronts split K, reduce via LDS, write without atomics
 //
+//   USE_SHUFFLE: B data layout
+//     0 — B is row-major [N, K_packed] (strided loads)
+//     1 — B is (16,16) tile-coalesced via shuffle_weight (coalesced loads)
+//
 // Workgroup layout: (N_WAVES × INTRA_K_SPLITS) wavefronts of 64 threads.
 // n_wave selects which N sub-tile; k_wave selects which K chunk.
 // After the K-loop, k_wave>0 stores partials to LDS, k_wave=0 reduces and writes.
@@ -56,6 +60,10 @@ typedef float __attribute__((ext_vector_type(16))) v16f32;
 
 #ifndef INTRA_K_SPLITS
 #define INTRA_K_SPLITS 1
+#endif
+
+#ifndef USE_SHUFFLE
+#define USE_SHUFFLE 0
 #endif
 
 #define TOTAL_WAVES   (N_WAVES * INTRA_K_SPLITS)
@@ -136,8 +144,23 @@ void mxfp4_gemm_kernel(
     const bool b_valid = (b_row < N);
 
     const long long a_row_off = (long long)a_row * K_packed;
-    const long long b_row_off = (long long)b_row * K_packed;
     const int a_scale_row_off = a_row * stride_asm;
+
+#if USE_SHUFFLE
+    // B_shuffle: (16,16) tile-coalesced layout
+    // Byte (n, k) is at: n_tile * K_packed * 16 + subtile * 256 + n_local * 16
+#if MFMA_MODE == 0
+    const int b_n_tile  = n_sub >> 4;                // n_sub is 16-aligned
+    const int b_n_local = lane_row;                  // 0..15
+#else
+    const int b_n_tile  = (n_sub >> 4) + (lane_row >> 4);  // 32-row tile spans 2 shuffle tiles
+    const int b_n_local = lane_row & 15;
+#endif
+    const long long b_tile_base = (long long)b_n_tile * K_packed * 16;
+    const int b_n_off = b_n_local * 16;              // 16 contiguous bytes per row within sub-tile
+#else
+    const long long b_row_off = (long long)b_row * K_packed;
+#endif
     const int b_scale_row_off = b_row * stride_bsn;
 
     // ---- K range for this wavefront ----
@@ -190,9 +213,17 @@ void mxfp4_gemm_kernel(
         b_reg[0] = 0; b_reg[1] = 0; b_reg[2] = 0; b_reg[3] = 0;
         b_reg[4] = 0; b_reg[5] = 0; b_reg[6] = 0; b_reg[7] = 0;
         if (b_valid) {
+#if USE_SHUFFLE
+            // Shuffled: sub-tile index = (k + lane_k_group*16) / 16
+            const int subtile = (k >> 4) + lane_k_group;
+            const int* b_src = reinterpret_cast<const int*>(
+                B + b_tile_base + (long long)subtile * 256 + b_n_off
+            );
+#else
             const int* b_src = reinterpret_cast<const int*>(
                 B + b_row_off + k + lane_k_group * 16
             );
+#endif
             b_reg[0] = b_src[0]; b_reg[1] = b_src[1];
             b_reg[2] = b_src[2]; b_reg[3] = b_src[3];
         }

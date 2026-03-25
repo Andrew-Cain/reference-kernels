@@ -193,3 +193,48 @@ Switched 4×2880×512, 16×2112×7168, and 32×2880×512 to 32x32 mode with LDS 
 instruction (64 bytes vs 32 bytes), so for K=512 shapes it's more compute-efficient.
 32x32 mode benefits the high-K shape where more external K-splits fill CUs better
 (66 tiles × 16 ext-K = 1056 WGs vs 33 tiles × 28 ext-K = 924 WGs).
+
+# Config Tuning v5 (revert regressions + iks=2 for large shapes)
+
+Reverted 32×2880×512 and 4×2880×512 to 16x16 mode with iks=4 (was 32x32 iks=8).
+Added iks=2 for 64×7168×2048 (eliminates atomics from ext-K=2) and 256×3072×1536.
+
+| M | N | K | Mode | IKS | Ext-K | Mean | Best | Worst | vs Reference | vs v4 |
+|---|------|------|------|-----|-------|------|------|-------|-------------|-------|
+| 4 | 2880 | 512 | 16x16 | 4 | 1 | 18.9 µs | 18.0 µs | 26.6 µs | 0.97x | -2% |
+| 16 | 2112 | 7168 | 32x32 | 1 | 16 | 27.6 µs | 26.5 µs | 34.1 µs | 0.83x | 0% |
+| 32 | 4096 | 512 | 16x16 | 4 | 1 | 19.8 µs | 19.0 µs | 27.8 µs | 1.00x | 0% |
+| 32 | 2880 | 512 | 16x16 | 4 | 1 | 19.5 µs | 18.6 µs | 25.3 µs | 0.98x | -12% |
+| 64 | 7168 | 2048 | 16x16 | 2 | 1 | 36.7 µs | 35.4 µs | 47.8 µs | 1.52x | -6% |
+| 256 | 3072 | 1536 | 16x16 | 2 | 1 | 34.8 µs | 33.6 µs | 39.1 µs | 1.51x | -4% |
+
+**Key findings:**
+- Reverting 32×2880×512 to 16x16 mode recovered from 22.1→19.5 µs (matches v3 LDS)
+- iks=2 for 64×7168×2048 improved 39.1→36.7 µs by eliminating atomic contention
+- iks=2 for 256×3072×1536 improved 36.2→34.8 µs
+- Both large shapes still 1.5x slower than reference — memory access pattern bottleneck
+
+# B_shuffle Coalesced Loads (v6)
+
+B_shuffle uses (16,16) tile-coalesced layout where each 16-row × 16-byte sub-tile
+occupies a contiguous 256-byte block. Eliminates strided memory access for B loads.
+Compile flag: `-DUSE_SHUFFLE=1`. B_scale still uses unshuffled row-major format.
+
+Shuffle disabled for 16×2112×7168 (mode 1/32x32) where it regressed (+5%).
+
+| M | N | K | Mode | Shuf | Mean | Best | Worst | vs Reference | vs v5 |
+|---|------|------|------|------|------|------|-------|-------------|-------|
+| 4 | 2880 | 512 | 16x16 | yes | 18.7 µs | 17.9 µs | 24.7 µs | 0.96x | -1% |
+| 16 | 2112 | 7168 | 32x32 | no | 27.8 µs | 26.8 µs | 32.4 µs | 0.83x | 0% |
+| 32 | 4096 | 512 | 16x16 | yes | 19.5 µs | 18.7 µs | 28.0 µs | 0.98x | -2% |
+| 32 | 2880 | 512 | 16x16 | yes | 19.2 µs | 18.3 µs | 26.1 µs | 0.96x | -2% |
+| 64 | 7168 | 2048 | 16x16 | yes | 33.4 µs | 32.3 µs | 43.6 µs | 1.38x | -9% |
+| 256 | 3072 | 1536 | 16x16 | yes | 31.3 µs | 30.3 µs | 35.7 µs | 1.36x | -10% |
+
+**Key findings:**
+- Large shapes (M=64, M=256) improved ~9-10% from coalesced B loads
+- K=512 shapes see small 1-2% improvement (already memory-efficient with small K)
+- 32x32 mode (16×2112×7168) regressed with shuffle — possibly because 32-row tiles
+  span two 16-row shuffle groups, reducing coalescing benefit
+- Remaining 1.36-1.38x gap vs reference is likely from: output write pattern,
+  A load striding, or reference's superior tile scheduling
